@@ -1,0 +1,263 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from solver import BSDESolver
+import HestonEquation_biv as eqn
+import HestonPDEsolver as pde
+import munch
+
+
+if __name__ == "__main__":
+
+ 
+    ## Setting
+ 
+    dim = 1 # dimension of brownian motion
+    dim_nohedge = 1 # dimension of non-hedgeable brownian motion
+    P = 2048 # number of outer Monte Carlo Loops
+    batch_size = 128
+    total_time = 1.0
+    num_time_interval = 10 # I have worked with 10 and 100
+    strike = 100
+
+    x_init = 100
+    v_init= 0.025
+
+    sigma = 0.1 
+    kappa = 0.5
+    theta = 0.05
+    rho = -0.45
+
+    r = 0.0
+    mu = 0.05
+
+
+    ## Algorithm configuration   
+    
+    config = {
+                "eqn_config": {
+                    "_comment": "LR of a call option under Heston",
+                    "eqn_name": "HestonCall",
+                    "total_time": total_time,
+                    "dim": dim,
+                    "dim_nohedge": dim_nohedge,
+                    "num_time_interval": num_time_interval,
+                    "strike": strike,
+                    "x_init": x_init,
+                    "v_init": v_init,
+                    "sigma": sigma,
+                    "kappa": kappa,
+                    "theta": theta,
+                    "rho": rho,
+                    "r": r ,
+                    "mu": mu,
+                },
+
+                "net_config": {
+                    "y_init_range": [0., 20.],
+                    "num_hiddens": [dim + dim_nohedge + 20, dim + dim_nohedge + 20, dim + dim_nohedge + 20, dim + dim_nohedge + 20],
+                    "lr_values": [5e-2, 5e-3],
+                    "lr_boundaries": [4000],
+                    "num_iterations": 8000,
+                    "batch_size": batch_size,
+                    "valid_size": 256,
+                    "logging_frequency": 100,
+                    "dtype": "float64",
+                    "verbose": True
+                }
+            }
+    
+    config = munch.munchify(config) 
+    bsde = getattr(eqn, config.eqn_config.eqn_name)(config.eqn_config)
+    tf.keras.backend.set_floatx(config.net_config.dtype)
+    
+    
+    ## Apply algorithm
+    
+    bsde_solver = BSDESolver(config, bsde)
+    training_history = bsde_solver.train()  
+
+    
+    '''
+   
+    Computing controls and hedging strategies
+    
+    '''
+    
+    ## Simulate trajectories
+       
+    dwb_test, xv_test = bsde.sample(P)
+ 
+
+    ## Save
+    #np.save('xv_test20.npy', xv_test)
+    #np.save('dwb_test20.npy', dwb_test)
+
+
+    ## Load
+    #xv_test = np.load('xv_test100_new.npy')
+    #dwb_test = np.load('dwb_test100_new.npy')
+    
+
+    ## Simulate solution of algorithm
+ 
+    lr_test = np.squeeze(bsde_solver.model.simulate_path([dwb_test, xv_test]))   
+
+    
+    ## Save  
+    #np.save('lr_test20.npy', lr_test)    
+    
+
+    ## Load
+    #lr_test = np.load('lr_test100_new.npy')
+    #lr_test = np.squeeze(lr_test)
+    
+    
+    ## Compute the controls in the BSDE approach
+    
+    all_one_vec = tf.ones(shape=tf.stack([tf.shape(dwb_test)[0], 1]), dtype=bsde_solver.model.net_config['dtype']) 
+    z = tf.expand_dims(tf.matmul(all_one_vec, bsde_solver.model.z_init), axis = 0) 
+    nets = bsde_solver.model.subnet 
+    zetas = [nets[t](xv_test[:, :, t+1], False) for t in range(0, bsde.num_time_interval-1)] 
+    zetas = tf.concat([z, zetas], axis = 0)
+    zetas = np.array(zetas) 
+    zetas = tf.convert_to_tensor(zetas) 
+    zetas_test = tf.transpose(zetas, [1, 2, 0])
+ 
+   
+    ## Save
+    #np.save('zetas_test20.npy', zetas_test)
+
+
+    ## Load
+    #zetas_test = np.load('zetas_test100_new.npy')
+
+
+    ## Compute the strategies in the BSDE approach
+
+    pi = np.divide(np.divide(np.squeeze(zetas_test[:, :dim, :]), np.squeeze(np.sqrt(xv_test[:, dim:, :num_time_interval]))), np.squeeze(xv_test[:, :dim,:num_time_interval]))
+    pi0 = lr_test[:, :num_time_interval] - np.divide(np.squeeze(zetas_test[:, :dim, :]), np.squeeze(np.sqrt(xv_test[:, dim:, :num_time_interval])))   
+ 
+   
+    '''
+    
+    Testing the solution in comparison to Heath - Platen - Schweizer's solution
+    
+    '''
+
+    ## Compute the solution to the PDE 
+    ## Grid [0, S] x [0, V]
+    
+    m1 = 500            # S
+    m2 = 100            # V
+    
+    ## Compute the prices with pde solver
+    
+    price_vector, price_grid, Vec_s, Vec_v = bsde.HPS_solution(m1, m2, x_init, 3*x_init, v_init, 5., strike)
+ 
+   
+    ## Save
+    #np.save('price_grid20.npy', price_grid)
+    #np.save('price_vector20.npy', price_vector)
+    #np.save('Vec_s20.npy', Vec_s)
+    #np.save('Vec_v20.npy', Vec_v)
+    
+
+    ## Load
+    #price_grid = np.load('price_grid100_new.npy')
+    #price_vector = np.load('price_vector100_new.npy')
+    #Vec_s = np.load('Vec_s100_new.npy')
+    #Vec_v = np.load('Vec_v100_new.npy')
+    
+
+    ## Interpolate the prices   
+    
+    price_pde = pde.interpolate_price(Vec_s, Vec_v, price_grid, P, num_time_interval, xv_test)   
+    
+
+    ## Save
+    #np.save('price_pde20.npy', price_pde)
+    
+
+    ## Load
+    #price_pde = np.load('price_pde100_new.npy')
+    
+
+    ## Compute the controls in the Heath - Platen - Schweizer's approach
+    
+    dirac_s_grid, dirac_v_grid = bsde.HPS_derivatives(m1, m2, price_vector, Vec_s, Vec_v)
+    dirac_s = pde.interpolate_price(Vec_s, Vec_v, dirac_s_grid, P, num_time_interval, xv_test) 
+    dirac_v = pde.interpolate_price(Vec_s, Vec_v, dirac_v_grid, P, num_time_interval, xv_test) 
+   
+ 
+    ## Compute the trategies in the Heath - Platen - Schweizer's approach
+ 
+    pi_HPS = dirac_s + rho * sigma * np.divide(dirac_v, np.squeeze(xv_test[:, :dim, :])) 
+    pi0_HPS = price_pde - np.multiply(theta_lr, np.squeeze(xv_test[:, :dim,:]))       
+
+    
+
+
+    '''
+    
+    PLOTS
+    
+    '''
+ 
+    '''  
+    f = plt.figure()
+    index = np.where(np.abs(xv_test[:10, 1, :num_time_interval])<1e-4)
+    time_steps = np.arange(num_time_interval)
+    plt.plot(time_steps, np.transpose(xv_test[:10, 1, :num_time_interval]))
+    plt.plot(time_steps[index[1]],np.transpose(xv_test[index[0], 1, index[1]]), 'k*')
+    '''  
+    '''
+    f1 = plt.figure()
+    mean_relative_error = np.abs(np.mean(lr_test, axis = 0)-np.mean(price_pde, axis = 0))/np.mean(price_pde, axis = 0)
+    plt.plot(np.arange(num_time_interval+1), mean_relative_error)
+    plt.ylabel('Relative error')
+    plt.xlabel('Time steps')
+    plt.title('Mean relative error for {} time steps'.format(num_time_interval))
+    #f1.savefig('Mean_Relative_error_10.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+
+    rand_vec = np.random.randint(0, 2048, 50)
+    f2 = plt.figure()
+    absolute_error = np.transpose(np.abs(lr_test[rand_vec, :] - price_pde[rand_vec, :]))
+    plt.plot(np.arange(num_time_interval+1), absolute_error)
+    plt.ylabel('Absolute error')
+    plt.xlabel('Time steps')
+    plt.title('Absolute error for {} time steps and random sampling'.format(num_time_interval))
+    #f2.savefig('Absolute_error_random_sampling10.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+    
+    f3 = plt.figure()
+    mean_absolute_error = np.abs(np.mean(lr_test, axis = 0)-np.mean(price_pde, axis = 0))
+    plt.plot(np.arange(num_time_interval+1), mean_absolute_error)
+    plt.ylabel('Absolute error')
+    plt.xlabel('Time steps')
+    plt.title('Mean absolute error for {} time steps'.format(num_time_interval))
+    #f3.savefig('Mean_Absolute_error_10.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+    '''
+
+    f =  plt.figure() 
+    plt.plot(np.transpose(pi_HPS[:10, :num_time_interval])) 
+    plt.title('Control_stock_HPS')  
+    #f.savefig('Control_stock_HPS_20.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+    f = plt.figure() 
+    plt.plot(np.transpose(pi[:10, :]))   
+    plt.title('Control_stock_solver') 
+    #f.savefig('Control_stock_solver_20.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+    f = plt.figure() 
+    plt.plot(np.transpose(pi0_HPS[:10, :num_time_interval]))   
+    plt.title('Control_bank_HPS')  
+    #f.savefig('Control_bank_HPS_20.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+    f = plt.figure() 
+    plt.plot(np.transpose(pi0[:10, :]))       
+    plt.title('Control_bank_solver') 
+    #f.savefig('Control_bank_solver_20.pdf', bbox_inches = 'tight', pad_inches = 0.01)
+    plt.show()
+
+
+    
+
